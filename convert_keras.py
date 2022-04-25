@@ -3,46 +3,29 @@ import tensorflow as tf
 import torch 
 import torch.nn as nn
 import mobile_cv
+import unittest
 
 def build_layer(x, torch_layer, layer_name=None):
     if isinstance(torch_layer, nn.Conv2d):
         use_bias = torch_layer.bias is not None
-        groups = torch_layer.groups 
 
-        if groups == 1:
-            zeropad = tf.keras.layers.ZeroPadding2D(padding=torch_layer.padding)
-            keras_module = tf.keras.layers.Conv2D(
-                filters=torch_layer.out_channels,
-                kernel_size=torch_layer.kernel_size,
-                strides=torch_layer.stride,
-                padding='valid',
-                activation=None,
-                use_bias=use_bias,
-                name=layer_name+"_conv"
-            )
-            keras_module.build(x.shape)
+        zeropad = tf.keras.layers.ZeroPadding2D(padding=torch_layer.padding)
+        keras_module = tf.keras.layers.Conv2D(
+            filters=torch_layer.out_channels,
+            kernel_size=torch_layer.kernel_size,
+            strides=torch_layer.stride,
+            groups=torch_layer.groups,
+            # depth_multiplier=torch_layer.out_channels // torch_layer.in_channels,
+            padding="valid",
+            activation=None,
+            use_bias=use_bias,
+            name=layer_name+"_conv"
+        )
+        keras_module.build(x.shape)
 
-            weights = [torch_layer.weight.permute((2,3,1,0)).detach().numpy()]
-            if use_bias:
-                weights.append(torch_layer.bias.detach().numpy())
-        else:
-            assert groups == torch_layer.out_channels, "Only depth_multiplier=1 supported"
-
-            zeropad = tf.keras.layers.ZeroPadding2D(padding=torch_layer.padding)
-            keras_module = tf.keras.layers.DepthwiseConv2D(
-                kernel_size=torch_layer.kernel_size,
-                strides=torch_layer.stride,
-                depth_multiplier=1,
-                padding="valid",
-                activation=None,
-                use_bias=use_bias,
-                name=layer_name+"_conv"
-            )
-            keras_module.build(x.shape)
-
-            weights = [torch_layer.weight.permute((2,3,0,1)).detach().numpy()]
-            if use_bias:
-                weights.append(torch_layer.bias.detach().numpy())
+        weights = [torch_layer.weight.permute((2,3,1,0)).detach().numpy()]
+        if use_bias:
+            weights.append(torch_layer.bias.detach().numpy())
 
         keras_module.set_weights(weights)
 
@@ -129,6 +112,17 @@ def build_layer(x, torch_layer, layer_name=None):
             out = build_layer(x, torch_layer.conv, layer_name=layer_name+"_conv")
         return out
 
+    elif isinstance(torch_layer, mobile_cv.arch.fbnet_v2.basic_blocks.ChannelShuffle):
+        groups = torch_layer.groups
+        height, width, in_channels = x.shape.as_list()[1:]
+        channels_per_group = in_channels // groups
+
+        x = tf.keras.layers.Reshape((height, width, groups, channels_per_group))(x)
+        x = tf.keras.layers.Permute((1, 2, 4, 3))(x)  # transpose
+        x = tf.keras.layers.Reshape((height, width, in_channels))(x)
+
+        return x
+
     elif isinstance(torch_layer, mobile_cv.arch.fbnet_v2.irf_block.IRFBlock):
         y = x
         if torch_layer.pw is not None:
@@ -202,5 +196,50 @@ def build_fbnet(fbnet):
         
         
 
+class UnitTest(unittest.TestCase):
 
+
+    def test_upper(self):
+        from mobile_cv.model_zoo.models.fbnet_v2 import fbnet
+        from mobile_cv.model_zoo.models.preprocess import get_preprocess
+        import numpy as np
+
+        def _get_input():
+            import urllib
+            from PIL import Image 
+
+            # Download an example image from the pytorch website
+            url, filename = (
+                "https://github.com/pytorch/hub/blob/master/images/dog.jpg?raw=true",
+                "dog.jpg",
+            )
+            local_filename, headers = urllib.request.urlretrieve(url, filename)
+            input_image = Image.open(local_filename)
+            return input_image
+
+        input_image = _get_input()
+
+        for model_name in ["FBNetV2_F1","FBNetV2_F2","FBNetV2_F3","FBNetV2_F4","FBNetV2_F5","FBNetV2_L1","FBNetV2_L2","fbnet_a","fbnet_b","fbnet_c","FBNetV3_A","FBNetV3_B","FBNetV3_C"]:
+            torch_model = fbnet(model_name, pretrained=True)
+            torch_model.eval()
+
+            keras_model = build_fbnet(torch_model)
+            
+            preprocess = get_preprocess(torch_model.arch_def['input_size'], torch_model.arch_def['input_size'])
+            input_tensor = preprocess(input_image)
+            x = input_tensor.unsqueeze(0)
+
+            torch_logits = torch_model(x)
+            keras_logits = keras_model.predict(x.permute([0,2,3,1]).numpy())
+
+            torch_logits = torch_logits.detach().numpy()
+
+            max_error = np.max(np.abs(torch_logits-keras_logits))
+            print("{} max error: {:.2}".format(model_name, max_error))
+
+            self.assertLess(max_error, 1e-4)
+
+
+if __name__ == '__main__':
+    unittest.main()
 
