@@ -4,3 +4,5 @@ dist/**
 **/__pycache__/**
 .vscode/**
 dog.jpg
+logger.out
+cpp.log
